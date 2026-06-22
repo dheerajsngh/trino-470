@@ -82,6 +82,14 @@ final class TracingInput
     }
 
     @Override
+    public void readVectored(java.util.List<io.trino.filesystem.FileRange> ranges, java.util.function.IntFunction<java.nio.ByteBuffer> allocator)
+            throws IOException
+    {
+        // Forward the ranges directly to the underlying HdfsInput stream
+        delegate.readVectored(ranges, allocator);
+    }
+
+    @Override
     public void close()
             throws IOException
     {

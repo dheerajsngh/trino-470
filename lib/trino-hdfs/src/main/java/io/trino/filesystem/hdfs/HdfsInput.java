@@ -28,6 +28,8 @@ import static java.util.Objects.requireNonNull;
 class HdfsInput
         implements TrinoInput
 {
+    private static final io.airlift.log.Logger log = io.airlift.log.Logger.get(HdfsInput.class);
+
     private final FSDataInputStream stream;
     private final TrinoInputFile inputFile;
     private boolean closed;
@@ -69,6 +71,55 @@ class HdfsInput
         }
         catch (IOException e) {
             throw new IOException("Read %s tail bytes of file %s failed: %s".formatted(bufferLength, toString(), e.getMessage()), e);
+        }
+    }
+
+    @Override
+    public void readVectored(java.util.List<io.trino.filesystem.FileRange> ranges, java.util.function.IntFunction<java.nio.ByteBuffer> allocator)
+            throws IOException
+    {
+        ensureOpen();
+        // log.info("VECTORED_IO_TRIGGERED: Dispatched parallelised GCS reads with %d ranges for file %s", ranges.size(), inputFile.location());
+        // Translate Trino's format-neutral FileRange models to Hadoop FileRange implementations
+        java.util.List<org.apache.hadoop.fs.FileRange> hadoopRanges = ranges.stream()
+                .map(range -> org.apache.hadoop.fs.FileRange.createFileRange(
+                        range.offset(),
+                        range.length()))
+                .collect(java.util.stream.Collectors.toList());
+
+        // Delegate to the underlying Hadoop stream to trigger VectoredIOImpl
+        try {
+            stream.readVectored(hadoopRanges, allocator);
+        }
+        catch (FileNotFoundException e) {
+            throw withCause(new FileNotFoundException("File %s not found: %s".formatted(toString(), e.getMessage())), e);
+        }
+        catch (IOException e) {
+            throw new IOException("Read vectored of file %s failed: %s".formatted(toString(), e.getMessage()), e);
+        }
+
+        // Propagate the futures from Hadoop's FileRanges back to Trino's FileRanges
+        for (int i = 0; i < ranges.size(); i++) {
+            io.trino.filesystem.FileRange trinoRange = ranges.get(i);
+            org.apache.hadoop.fs.FileRange hadoopRange = hadoopRanges.get(i);
+            hadoopRange.getData().whenComplete((buffer, throwable) -> {
+                if (throwable != null) {
+                    trinoRange.data().completeExceptionally(throwable);
+                }
+                else {
+                    trinoRange.data().complete(buffer);
+                }
+            });
+        }
+
+        // Block the main thread, waiting for all background GCS transfers to finish
+        for (org.apache.hadoop.fs.FileRange hadoopRange : hadoopRanges) {
+            try {
+                hadoopRange.getData().get(); // Synchronous block until this segment is fully downloaded
+            }
+            catch (java.util.concurrent.ExecutionException | InterruptedException e) {
+                throw new java.io.IOException("Vectored read failed asynchronously inside GCS connector", e);
+            }
         }
     }
 

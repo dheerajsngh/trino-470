@@ -41,9 +41,24 @@ public interface ParquetDataSource
 
     <K> Map<K, ChunkedInputStream> planRead(ListMultimap<K, DiskRange> diskRanges, AggregatedMemoryContext memoryContext);
 
+    default java.util.List<java.util.concurrent.CompletableFuture<java.nio.ByteBuffer>> readVectored(java.util.List<io.trino.filesystem.FileRange> ranges, java.util.function.IntFunction<java.nio.ByteBuffer> allocator)
+            throws IOException
+    {
+        throw new UnsupportedOperationException("readVectored is not implemented for this Parquet Data Source");
+    }
+
+    default void fetchRangesVectored(java.util.List<io.trino.filesystem.FileRange> ranges, io.trino.memory.context.LocalMemoryContext memoryContext)
+            throws IOException
+    {
+        java.util.function.IntFunction<java.nio.ByteBuffer> trackedAllocator = size -> {
+            memoryContext.setBytes(memoryContext.getBytes() + size);
+            return java.nio.ByteBuffer.allocate(size);
+        };
+        readVectored(ranges, trackedAllocator);
+    }
+
     @Override
     default void close()
             throws IOException
-    {
-    }
+    {}
 }

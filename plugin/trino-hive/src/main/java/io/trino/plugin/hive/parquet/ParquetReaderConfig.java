@@ -29,7 +29,7 @@ import jakarta.validation.constraints.NotNull;
         "hive.parquet.fail-on-corrupted-statistics",
         "parquet.fail-on-corrupted-statistics",
         "parquet.optimized-reader.enabled",
-        "parquet.optimized-nested-reader.enabled"
+        "parquet.optimized-nested-reader.enabled",
 })
 public class ParquetReaderConfig
 {
@@ -158,6 +158,19 @@ public class ParquetReaderConfig
     public boolean isVectorizedDecodingEnabled()
     {
         return options.isVectorizedDecodingEnabled();
+    }
+
+    @Config("parquet.vectored-reader-enabled")
+    @ConfigDescription("Enable using vectored I/O for reading parquet files")
+    public ParquetReaderConfig setVectoredReaderEnabled(boolean enabled)
+    {
+        options = options.withVectoredReaderEnabled(enabled);
+        return this;
+    }
+
+    public boolean isVectoredReaderEnabled()
+    {
+        return options.isVectoredReaderEnabled();
     }
 
     public ParquetReaderOptions toParquetReaderOptions()

@@ -40,6 +40,21 @@ public class TrinoParquetDataSource
     }
 
     @Override
+    public java.util.List<java.util.concurrent.CompletableFuture<java.nio.ByteBuffer>> readVectored(java.util.List<io.trino.filesystem.FileRange> ranges, java.util.function.IntFunction<java.nio.ByteBuffer> allocator)
+            throws IOException
+    {
+        long readStart = System.nanoTime();
+
+        input.readVectored(ranges, allocator);
+        long totalLength = ranges.stream().mapToLong(io.trino.filesystem.FileRange::length).sum();
+        stats.readDataBytesPerSecond(totalLength, System.nanoTime() - readStart);
+
+        return ranges.stream()
+                .map(io.trino.filesystem.FileRange::data)
+                .collect(java.util.stream.Collectors.toList());
+    }
+
+    @Override
     public void close()
             throws IOException
     {

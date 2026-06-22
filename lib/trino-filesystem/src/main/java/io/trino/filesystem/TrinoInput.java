@@ -43,4 +43,17 @@ public interface TrinoInput
         int read = readTail(buffer, 0, length);
         return Slices.wrappedBuffer(buffer, 0, read);
     }
+
+    default void readVectored(java.util.List<FileRange> ranges, java.util.function.IntFunction<java.nio.ByteBuffer> allocator)
+            throws IOException
+    {
+        for (FileRange range : ranges) {
+            byte[] buffer = new byte[range.length()];
+            readFully(range.offset(), buffer, 0, buffer.length);
+            java.nio.ByteBuffer byteBuffer = allocator.apply(buffer.length);
+            byteBuffer.put(buffer);
+            byteBuffer.flip();
+            range.data().complete(byteBuffer);
+        }
+    }
 }

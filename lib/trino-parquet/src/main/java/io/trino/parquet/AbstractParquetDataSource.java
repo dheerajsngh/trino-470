@@ -44,11 +44,14 @@ import static java.util.Objects.requireNonNull;
 public abstract class AbstractParquetDataSource
         implements ParquetDataSource
 {
+    private static final io.airlift.log.Logger log = io.airlift.log.Logger.get(AbstractParquetDataSource.class);
+
     private final ParquetDataSourceId id;
     private final long estimatedSize;
     private final ParquetReaderOptions options;
     private long readTimeNanos;
     private long readBytes;
+    private final Map<DiskRange, java.util.concurrent.CompletableFuture<java.nio.ByteBuffer>> vectoredBuffers = new java.util.concurrent.ConcurrentHashMap<>();
 
     protected AbstractParquetDataSource(ParquetDataSourceId id, long estimatedSize, ParquetReaderOptions options)
     {
@@ -162,6 +165,26 @@ public abstract class AbstractParquetDataSource
         ListMultimap<K, DiskRange> smallRanges = smallRangesBuilder.build();
         ListMultimap<K, DiskRange> largeRanges = largeRangesBuilder.build();
 
+        // Collect the actual ranges to be read to pre-fetch them using vectored read
+        java.util.List<DiskRange> rangesToFetch = new java.util.ArrayList<>();
+        if (!smallRanges.isEmpty()) {
+            Iterable<DiskRange> mergedRanges = mergeAdjacentDiskRanges(smallRanges.values(), options.getMaxMergeDistance(), options.getMaxBufferSize());
+            mergedRanges.forEach(rangesToFetch::add);
+        }
+        largeRanges.values().forEach(rangesToFetch::add);
+
+        if (rangesToFetch.size() >= 1) {
+            try {
+                java.util.List<io.trino.filesystem.FileRange> fileRanges = rangesToFetch.stream()
+                        .map(range -> new io.trino.filesystem.FileRange(range.getOffset(), (int) range.getLength()))
+                        .collect(java.util.stream.Collectors.toList());
+                fetchRangesVectored(fileRanges, memoryContext.newLocalMemoryContext(AbstractParquetDataSource.class.getSimpleName()));
+            }
+            catch (IOException e) {
+                throw new RuntimeException("Failed to pre-fetch Parquet ranges using vectored I/O", e);
+            }
+        }
+
         // read ranges
         ImmutableListMultimap.Builder<K, ChunkReader> slices = ImmutableListMultimap.builder();
         slices.putAll(readSmallDiskRanges(smallRanges, memoryContext));
@@ -199,7 +222,23 @@ public abstract class AbstractParquetDataSource
             return ImmutableListMultimap.of();
         }
 
+        // 1. Log the incoming UNMERGED ranges
+        // StringBuilder unmergedLog = new StringBuilder();
+        // for (DiskRange range : diskRanges.values()) {
+        //     unmergedLog.append(String.format("[%d, %d] ", range.getOffset(), range.getLength()));
+        // }
+        // log.info("DEBUG_RANGE_LOG: Unmerged ranges for file %s (Count: %d): %s", getId(), diskRanges.size(), unmergedLog.toString());
+
         Iterable<DiskRange> mergedRanges = mergeAdjacentDiskRanges(diskRanges.values(), options.getMaxMergeDistance(), options.getMaxBufferSize());
+
+        // 2. Log the resulting MERGED ranges
+        // StringBuilder mergedLog = new StringBuilder();
+        // int mergedCount = 0;
+        // for (DiskRange range : mergedRanges) {
+        //     mergedLog.append(String.format("[%d, %d] ", range.getOffset(), range.getLength()));
+        //     mergedCount++;
+        // }
+        // log.info("DEBUG_RANGE_LOG: Merged ranges for file %s (Count: %d): %s", getId(), mergedCount, mergedLog.toString());
 
         ImmutableListMultimap.Builder<K, ChunkReader> slices = ImmutableListMultimap.builder();
         for (DiskRange mergedRange : mergedRanges) {
@@ -291,6 +330,35 @@ public abstract class AbstractParquetDataSource
         return result.build();
     }
 
+    @Override
+    public java.util.List<java.util.concurrent.CompletableFuture<java.nio.ByteBuffer>> readVectored(java.util.List<io.trino.filesystem.FileRange> ranges, java.util.function.IntFunction<java.nio.ByteBuffer> allocator)
+            throws IOException
+    {
+        throw new UnsupportedOperationException("readVectored is not implemented for this Parquet Data Source");
+    }
+
+    @Override
+    public void fetchRangesVectored(java.util.List<io.trino.filesystem.FileRange> ranges, LocalMemoryContext memoryContext)
+            throws IOException
+    {
+        java.util.function.IntFunction<java.nio.ByteBuffer> trackedAllocator = size -> {
+            memoryContext.setBytes(memoryContext.getBytes() + size);
+            return java.nio.ByteBuffer.allocate(size);
+        };
+        java.util.List<java.util.concurrent.CompletableFuture<java.nio.ByteBuffer>> futures = readVectored(ranges, trackedAllocator);
+        for (int i = 0; i < ranges.size(); i++) {
+            io.trino.filesystem.FileRange fileRange = ranges.get(i);
+            vectoredBuffers.put(new DiskRange(fileRange.offset(), fileRange.length()), futures.get(i));
+        }
+    }
+
+    @Override
+    public void close()
+            throws IOException
+    {
+        vectoredBuffers.clear();
+    }
+
     private class ReferenceCountedReader
             implements ChunkReader
     {
@@ -327,10 +395,24 @@ public abstract class AbstractParquetDataSource
             checkState(referenceCount > 0, "Chunk reader is already closed");
 
             if (data == null) {
-                byte[] buffer = new byte[toIntExact(range.getLength())];
-                readerMemoryUsage.setBytes(buffer.length);
-                readFully(range.getOffset(), buffer, 0, buffer.length);
-                data = Slices.wrappedBuffer(buffer);
+                java.util.concurrent.CompletableFuture<java.nio.ByteBuffer> future = vectoredBuffers.remove(range);
+                if (future != null) {
+                    try {
+                        java.nio.ByteBuffer byteBuffer = future.get();
+                        byte[] buffer = new byte[byteBuffer.remaining()];
+                        byteBuffer.get(buffer);
+                        data = Slices.wrappedBuffer(buffer);
+                    }
+                    catch (Exception e) {
+                        throw new IOException("Failed to read vectored range " + range, e);
+                    }
+                }
+                else {
+                    byte[] buffer = new byte[toIntExact(range.getLength())];
+                    readerMemoryUsage.setBytes(buffer.length);
+                    readFully(range.getOffset(), buffer, 0, buffer.length);
+                    data = Slices.wrappedBuffer(buffer);
+                }
             }
 
             return data;
